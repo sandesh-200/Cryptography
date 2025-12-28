@@ -10,7 +10,7 @@ from ecdsa import SigningKey,SECP256k1
 private_key = SigningKey.generate(curve=SECP256k1)
 public_key = private_key.get_verifying_key()
 
-message = b"Send 1 BTC to Alice" #Basically message here represents signature
+message = b"Send 1 BTC to Alice" #Basically message here represents transaction
 
 #Sign the message
 signature = private_key.sign(message)
