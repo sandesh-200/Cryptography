@@ -1,0 +1,470 @@
+
+<style>
+  #ecc-canvas { display:block; width:100%; border-radius:12px; background:#0a0a12; cursor:default; }
+  #ecc-ui { background:#0a0a12; border-radius:12px; padding:16px 20px 20px; font-family:monospace; }
+  #ecc-controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:12px; }
+  .ecc-btn { background:transparent; border:0.5px solid #444; color:#ccc; padding:6px 14px; border-radius:6px; cursor:pointer; font-size:13px; font-family:monospace; transition:all .2s; }
+  .ecc-btn:hover { background:#1a1a2e; border-color:#7c6fcd; color:#fff; }
+  .ecc-slider-wrap { display:flex; align-items:center; gap:8px; flex:1; min-width:180px; }
+  .ecc-slider-wrap label { color:#888; font-size:12px; white-space:nowrap; }
+  .ecc-slider-wrap input[type=range] { flex:1; accent-color:#7c6fcd; }
+  #ecc-caption { min-height:32px; color:#c8b8ff; font-size:13px; text-align:center; padding:8px 0 0; letter-spacing:.02em; transition:opacity .4s; }
+</style>
+
+<div id="ecc-ui">
+  <h2 class="sr-only">Interactive elliptic curve point addition and doubling animation</h2>
+  <canvas id="ecc-canvas"></canvas>
+  <div id="ecc-caption">A secant line connects two distinct points on the curve.</div>
+  <div id="ecc-controls">
+    <button class="ecc-btn" id="btn-play">⏸ Pause</button>
+    <button class="ecc-btn" id="btn-reset">↺ Reset</button>
+    <div class="ecc-slider-wrap">
+      <label>Q position</label>
+      <input type="range" id="slider-q" min="0" max="1000" value="0" step="1">
+    </div>
+    <div class="ecc-slider-wrap" style="flex:0 0 auto; min-width:140px;">
+      <label>Speed</label>
+      <input type="range" id="slider-speed" min="1" max="10" value="4" step="1">
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const canvas = document.getElementById('ecc-canvas');
+  const ctx = canvas.getContext('2d');
+  const caption = document.getElementById('ecc-caption');
+  const btnPlay = document.getElementById('btn-play');
+  const btnReset = document.getElementById('btn-reset');
+  const sliderQ = document.getElementById('slider-q');
+  const sliderSpeed = document.getElementById('slider-speed');
+
+  // Curve: y^2 = x^3 - x + 1
+  function f(x){ return x*x*x - x + 1; }
+  function fPrime(x){ return 3*x*x - 1; }
+
+  // Canvas sizing
+  let W, H, ox, oy, scale;
+  function resize(){
+    const rect = canvas.parentElement.getBoundingClientRect();
+    W = Math.min(rect.width - 40, 680);
+    H = Math.round(W * 0.62);
+    canvas.width = W * devicePixelRatio;
+    canvas.height = H * devicePixelRatio;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.scale(devicePixelRatio, devicePixelRatio);
+    ox = W * 0.42;
+    oy = H * 0.52;
+    scale = W * 0.115;
+  }
+
+  // Math <-> canvas conversions
+  function toC(mx, my){ return [ox + mx*scale, oy - my*scale]; }
+  function fromC(cx, cy){ return [(cx-ox)/scale, (oy-cy)/scale]; }
+
+  // Sample the real curve branch (y>0 and y<0)
+  function sampleCurve(){
+    const pts_top=[], pts_bot=[];
+    for(let mx=-2.2; mx<=2.2; mx+=0.015){
+      const fy=f(mx);
+      if(fy>=0){
+        const y=Math.sqrt(fy);
+        pts_top.push([mx,y]);
+        pts_bot.push([mx,-y]);
+      }
+    }
+    return {top:pts_top, bot:pts_bot};
+  }
+
+  // Get a point on curve by x (upper branch)
+  function curvePoint(mx){
+    const fy=f(mx);
+    if(fy<0) return null;
+    return {x:mx, y:Math.sqrt(fy)};
+  }
+
+  // Find third intersection of line through (x1,y1),(x2,y2) with curve
+  // Line: y = m*x + b => (mx+b)^2 = x^3 - x + 1
+  // x^3 - m^2*x^2 - (2mb+1)*x + (1-b^2) = 0
+  // Roots sum: x1+x2+x3 = m^2
+  function thirdIntersection(p1, p2){
+    let m, b;
+    const eps = 1e-6;
+    if(Math.abs(p2.x - p1.x) < eps){
+      // vertical — degenerate, skip
+      return null;
+    }
+    m = (p2.y - p1.y)/(p2.x - p1.x);
+    b = p1.y - m*p1.x;
+    // Vieta: x1+x2+x3 = m^2
+    const x3 = m*m - p1.x - p2.x;
+    const y3_line = m*x3 + b;
+    return {x:x3, y:y3_line};
+  }
+
+  // Tangent case (doubling)
+  function doublingIntersection(p){
+    // slope of tangent: dy/dx = (3x^2-1)/(2y)
+    if(Math.abs(p.y)<1e-7) return null;
+    const m = fPrime(p.x)/(2*p.y);
+    const b = p.y - m*p.x;
+    const x3 = m*m - 2*p.x;
+    const y3 = m*x3 + b;
+    return {x:x3, y:y3};
+  }
+
+  // Fixed P position
+  const Px = -0.7;
+  const Pp = curvePoint(Px);
+
+  // Q travels from far away toward P
+  const Q_START_X = 1.55;
+  const Q_END_X = Px + 0.0005;
+
+  // Animation state
+  let t = 0; // 0..1 progress
+  let playing = true;
+  let rafId = null;
+  let lastTime = null;
+  const DURATION = 7000; // ms for full sweep
+
+  // Reflection animation
+  let reflectPhase = 0; // 0=normal, >0=animating reflection
+  let reflectY_from = 0, reflectY_to = 0;
+  let reflectX = 0;
+  let reflectDone = false;
+
+  function getQx(t){
+    // Ease-in-out, with slowdown near end
+    const ease = t < 0.5 ? 2*t*t : -1+(4-2*t)*t;
+    return Q_START_X + ease*(Q_END_X - Q_START_X);
+  }
+
+  function lerp(a,b,t){ return a+(b-a)*t; }
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+  // Caption logic
+  const captions = [
+    [0,    0.05, "A secant line connects two distinct points on the curve."],
+    [0.05, 0.35, "As Q moves closer to P…"],
+    [0.35, 0.60, "The secant line begins approaching a tangent line."],
+    [0.60, 0.80, "The two points are nearly one — watch the line pivot."],
+    [0.80, 0.95, "The secant has become a tangent. P and Q are the same point."],
+    [0.95, 1.01, "This is why point doubling uses a tangent line. The result is 2P."],
+  ];
+  let lastCaption = '';
+  function updateCaption(t){
+    for(const [a,b,txt] of captions){
+      if(t>=a && t<b){
+        if(txt!==lastCaption){ caption.textContent=txt; lastCaption=txt; }
+        return;
+      }
+    }
+  }
+
+  // Draw helpers
+  function drawCurve(curve){
+    const {top,bot}=curve;
+    ctx.lineWidth=2.5;
+    // Glow
+    ctx.shadowColor='#7c6fcd';
+    ctx.shadowBlur=18;
+    ctx.strokeStyle='#9b8fff';
+    for(const pts of [top,bot]){
+      if(pts.length<2) continue;
+      ctx.beginPath();
+      let first=true;
+      for(const [mx,my] of pts){
+        const [cx,cy]=toC(mx,my);
+        if(first){ctx.moveTo(cx,cy); first=false;}
+        else ctx.lineTo(cx,cy);
+      }
+      ctx.stroke();
+    }
+    ctx.shadowBlur=0;
+  }
+
+  function drawAxes(){
+    ctx.strokeStyle='#2a2a40';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(0,oy); ctx.lineTo(W,oy);
+    ctx.moveTo(ox,0); ctx.lineTo(ox,H);
+    ctx.stroke();
+    // Tick marks
+    ctx.fillStyle='#3a3a55';
+    ctx.font='10px monospace';
+    ctx.textAlign='center';
+    for(let mx=-2;mx<=2;mx++){
+      if(mx===0) continue;
+      const [cx]=toC(mx,0);
+      ctx.fillStyle='#2a2a3e';
+      ctx.beginPath(); ctx.moveTo(cx,oy-4); ctx.lineTo(cx,oy+4); ctx.stroke();
+    }
+  }
+
+  function drawGrid(){
+    ctx.strokeStyle='#111122';
+    ctx.lineWidth=0.5;
+    for(let mx=-2.5;mx<=2.5;mx+=0.5){
+      const [cx]=toC(mx,0);
+      ctx.beginPath(); ctx.moveTo(cx,0); ctx.lineTo(cx,H); ctx.stroke();
+    }
+    for(let my=-3;my<=3;my+=0.5){
+      const [,cy]=toC(0,my);
+      ctx.beginPath(); ctx.moveTo(0,cy); ctx.lineTo(W,cy); ctx.stroke();
+    }
+  }
+
+  function glowPoint(mx,my,color,radius,glowR,label,sublabel,side){
+    const [cx,cy]=toC(mx,my);
+    // outer glow
+    const grad=ctx.createRadialGradient(cx,cy,1,cx,cy,glowR);
+    grad.addColorStop(0,color+'66');
+    grad.addColorStop(1,color+'00');
+    ctx.beginPath(); ctx.arc(cx,cy,glowR,0,Math.PI*2);
+    ctx.fillStyle=grad; ctx.fill();
+    // inner dot
+    ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2);
+    ctx.fillStyle=color; ctx.fill();
+    ctx.strokeStyle='#fff3'; ctx.lineWidth=1; ctx.stroke();
+    // label
+    if(label){
+      ctx.font='bold 13px monospace';
+      ctx.fillStyle=color;
+      ctx.shadowColor=color; ctx.shadowBlur=8;
+      const lx = side==='left' ? cx-14 : cx+14;
+      const ly = cy-12;
+      ctx.textAlign = side==='left' ? 'right' : 'left';
+      ctx.fillText(label, lx, ly);
+      if(sublabel){
+        ctx.font='11px monospace';
+        ctx.fillStyle='#aaa';
+        ctx.fillText(sublabel, lx, ly+14);
+      }
+      ctx.shadowBlur=0;
+    }
+  }
+
+  function drawLine(x1,y1,x2,y2,color,dashed,label,alpha){
+    alpha=alpha||1;
+    const [cx1,cy1]=toC(x1,y1);
+    const [cx2,cy2]=toC(x2,y2);
+    // Extend line to canvas edges
+    const dx=cx2-cx1, dy=cy2-cy1;
+    const len=Math.sqrt(dx*dx+dy*dy);
+    if(len<1) return;
+    const ux=dx/len, uy=dy/len;
+    const tMax=Math.max(W,H)*3;
+    const ex1=cx1-ux*tMax, ey1=cy1-uy*tMax;
+    const ex2=cx1+ux*tMax, ey2=cy1+uy*tMax;
+
+    ctx.save();
+    ctx.globalAlpha=alpha;
+    ctx.strokeStyle=color;
+    ctx.lineWidth=1.5;
+    ctx.shadowColor=color;
+    ctx.shadowBlur=10;
+    if(dashed) ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    ctx.moveTo(ex1,ey1);
+    ctx.lineTo(ex2,ey2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.shadowBlur=0;
+
+    // Label near midpoint
+    if(label){
+      const midX=(ex1+ex2)/2, midY=(ey1+ey2)/2;
+      const nx=-uy*18, ny=ux*18;
+      ctx.font='11px monospace';
+      ctx.fillStyle=color;
+      ctx.textAlign='center';
+      ctx.fillText(label, clamp(midX+nx,40,W-40), clamp(midY+ny,14,H-8));
+    }
+    ctx.restore();
+  }
+
+  function drawVerticalDash(mx,y1,y2,color){
+    const [cx,cy1]=toC(mx,y1);
+    const [,cy2]=toC(mx,y2);
+    ctx.save();
+    ctx.strokeStyle=color;
+    ctx.lineWidth=1.2;
+    ctx.globalAlpha=0.7;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(cx,cy1); ctx.lineTo(cx,cy2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  function drawFrame(){
+    ctx.clearRect(0,0,W,H);
+    drawGrid();
+    drawAxes();
+
+    const curve=sampleCurve();
+    drawCurve(curve);
+
+    const qx = getQx(clamp(t,0,1));
+    const qp = curvePoint(qx);
+    if(!qp) return;
+
+    const nearlyDoubling = t > 0.88;
+    const fullyDoubling = t > 0.97;
+
+    // Compute secant or tangent
+    let linePt1=Pp, linePt2=qp;
+    let lineColor='#4ecdc4';
+    let lineLabel='';
+    let lineAlpha=1;
+
+    if(fullyDoubling){
+      lineLabel='Tangent line → 2P';
+      lineColor='#ff9f43';
+    } else {
+      lineLabel= nearlyDoubling ? 'Secant → Tangent' : 'Secant line';
+      lineColor= nearlyDoubling ? lerp_color('#4ecdc4','#ff9f43',(t-0.88)/0.09) : '#4ecdc4';
+    }
+
+    // Third intersection point
+    let intPt=null, reflPt=null;
+    if(fullyDoubling){
+      intPt=doublingIntersection(Pp);
+    } else {
+      intPt=thirdIntersection(Pp, qp);
+    }
+    if(intPt){
+      reflPt={x:intPt.x, y:-intPt.y};
+    }
+
+    // Draw secant/tangent
+    if(!fullyDoubling){
+      drawLine(linePt1.x,linePt1.y, linePt2.x,linePt2.y, lineColor, false, lineLabel);
+    } else {
+      drawLine(Pp.x, Pp.y, Pp.x+1.5, doublingIntersection(Pp)?doublingIntersection(Pp).y + 1.5*(fPrime(Pp.x)/(2*Pp.y)):Pp.y, lineColor, false, lineLabel);
+      // draw tangent properly
+      const m=fPrime(Pp.x)/(2*Pp.y);
+      const b2=Pp.y-m*Pp.x;
+      const x2=Pp.x+2;
+      drawLine(Pp.x,Pp.y, x2, m*x2+b2, lineColor, false, lineLabel);
+    }
+
+    // Vertical dashed to reflection
+    if(intPt && reflPt && t>0.1){
+      const alpha=clamp((t-0.1)/0.15,0,1);
+      drawVerticalDash(intPt.x, intPt.y, 0, '#ffffff');
+      // Animated reflection
+      let drawY=intPt.y;
+      if(t>0.15){
+        const rp=clamp((t-0.15)/0.2,0,1);
+        drawY=lerp(intPt.y,reflPt.y,easeOut(rp));
+      }
+      if(t>0.15){
+        drawVerticalDash(intPt.x, 0, reflPt.y, '#ffffff');
+        const reflLabel=fullyDoubling?'2P':'P + Q';
+        const reflColor=fullyDoubling?'#ff9f43':'#f9ca24';
+        glowPoint(intPt.x, drawY, reflColor, 6, 22, reflLabel, null, intPt.x<Pp.x?'left':'right');
+      }
+    }
+
+    // Third intersection
+    if(intPt && t>0.05){
+      const alpha=clamp((t-0.05)/0.1,0,1);
+      ctx.globalAlpha=alpha;
+      glowPoint(intPt.x,intPt.y,'#ff6b9d',5,18,'−R',null, intPt.x<Pp.x?'left':'right');
+      ctx.globalAlpha=1;
+    }
+
+    // Q point
+    if(!fullyDoubling){
+      glowPoint(qp.x,qp.y,'#4ecdc4',6,20,'Q','',nearlyDoubling?'right':'right');
+    }
+
+    // P point
+    glowPoint(Pp.x,Pp.y,'#a29bfe',7,24,'P',null,'left');
+
+    // Zoom-in effect near doubling
+    if(nearlyDoubling){
+      const zoomAlpha=clamp((t-0.88)/0.12,0,0.06);
+      ctx.save();
+      ctx.strokeStyle='#ff9f43';
+      ctx.lineWidth=2;
+      ctx.globalAlpha=zoomAlpha*3;
+      const [px,py]=toC(Pp.x,Pp.y);
+      const r=clamp(80-60*((t-0.88)/0.12),20,80);
+      ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    updateCaption(t);
+  }
+
+  function easeOut(t){ return 1-(1-t)*(1-t); }
+
+  function lerp_color(a,b,t){
+    // Hex color lerp
+    const pa=parseInt(a.slice(1),16), pb=parseInt(b.slice(1),16);
+    const ar=pa>>16, ag=(pa>>8)&0xff, ab=pa&0xff;
+    const br=pb>>16, bg=(pb>>8)&0xff, bb=pb&0xff;
+    const r=Math.round(ar+(br-ar)*t);
+    const g=Math.round(ag+(bg-ag)*t);
+    const bl2=Math.round(ab+(bb-ab)*t);
+    return '#'+[r,g,bl2].map(v=>v.toString(16).padStart(2,'0')).join('');
+  }
+
+  function tick(ts){
+    if(!playing){ rafId=requestAnimationFrame(tick); return; }
+    if(!lastTime) lastTime=ts;
+    const dt=(ts-lastTime)/1000;
+    lastTime=ts;
+    const speed=parseInt(sliderSpeed.value)||4;
+    const rate=speed*0.018;
+    t=clamp(t+dt*rate,0,1);
+    sliderQ.value=Math.round(t*1000);
+    drawFrame();
+    if(t<1) rafId=requestAnimationFrame(tick);
+    else {
+      playing=false;
+      btnPlay.textContent='▶ Play';
+      drawFrame();
+    }
+  }
+
+  btnPlay.addEventListener('click',()=>{
+    playing=!playing;
+    btnPlay.textContent=playing?'⏸ Pause':'▶ Play';
+    if(playing){
+      lastTime=null;
+      if(t>=1) t=0;
+      rafId=requestAnimationFrame(tick);
+    }
+  });
+
+  btnReset.addEventListener('click',()=>{
+    t=0; playing=true; lastTime=null;
+    sliderQ.value=0;
+    btnPlay.textContent='⏸ Pause';
+    caption.textContent='A secant line connects two distinct points on the curve.';
+    lastCaption='';
+    drawFrame();
+  });
+
+  sliderQ.addEventListener('input',()=>{
+    t=parseInt(sliderQ.value)/1000;
+    if(t>=1){ playing=false; btnPlay.textContent='▶ Play'; }
+    drawFrame();
+  });
+
+  window.addEventListener('resize',()=>{
+    resize(); drawFrame();
+  });
+
+  resize();
+  drawFrame();
+  rafId=requestAnimationFrame(tick);
+})();
+</script>

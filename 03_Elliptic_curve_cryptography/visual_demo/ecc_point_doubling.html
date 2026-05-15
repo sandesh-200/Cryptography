@@ -1,0 +1,506 @@
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: transparent; }
+  #ecc-wrap { background: #0a0e1a; border-radius: 12px; padding: 0; overflow: hidden; font-family: var(--font-sans, sans-serif); }
+  #ecc-canvas { display: block; width: 100%; }
+  #controls { background: #0f1423; border-top: 1px solid #1e2a4a; padding: 12px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .ctrl-btn { background: #1a2240; border: 1px solid #2a3860; color: #7eb8ff; font-size: 12px; padding: 6px 14px; border-radius: 6px; cursor: pointer; transition: all .2s; display: flex; align-items: center; gap: 6px; }
+  .ctrl-btn:hover { background: #243058; border-color: #4a6aaa; }
+  .ctrl-btn.active { background: #1e3a6e; border-color: #5b9ef9; color: #9ecfff; }
+  .ctrl-label { font-size: 11px; color: #4a6080; white-space: nowrap; }
+  #speed-slider { -webkit-appearance: none; height: 4px; background: #1e2a4a; border-radius: 2px; outline: none; width: 80px; }
+  #speed-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #5b9ef9; cursor: pointer; }
+  #info-panel { background: #0f1423; border-top: 1px solid #1e2a4a; padding: 10px 16px; min-height: 44px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .info-tag { font-size: 11px; padding: 3px 10px; border-radius: 4px; font-weight: 500; }
+  .info-step { color: #7eb8ff; background: #1a2a4a; }
+  .info-desc { color: #8aa8c0; font-size: 12px; }
+  .info-formula { color: #a0c4ff; font-size: 11px; font-family: var(--font-mono, monospace); background: #131b30; padding: 3px 8px; border-radius: 4px; }
+  #toggle-labels { }
+</style>
+<div id="ecc-wrap">
+  <h2 class="sr-only">Elliptic curve point doubling: P to 8P via repeated doubling, animated step by step</h2>
+  <canvas id="ecc-canvas"></canvas>
+  <div id="info-panel">
+    <span class="info-tag info-step" id="step-tag">Ready</span>
+    <span class="info-desc" id="step-desc">Press Play or Step to begin point doubling animation</span>
+    <span class="info-formula" id="step-formula">y² = x³ − x + 1</span>
+  </div>
+  <div id="controls">
+    <button class="ctrl-btn" id="btn-play" onclick="togglePlay()"><i class="ti ti-player-play" aria-hidden="true"></i> Play</button>
+    <button class="ctrl-btn" id="btn-step" onclick="stepForward()"><i class="ti ti-arrow-right" aria-hidden="true"></i> Step</button>
+    <button class="ctrl-btn" id="btn-reset" onclick="resetAnim()"><i class="ti ti-refresh" aria-hidden="true"></i> Reset</button>
+    <span class="ctrl-label">Speed</span>
+    <input type="range" id="speed-slider" min="1" max="10" value="5" step="1" oninput="updateSpeed(this.value)">
+    <button class="ctrl-btn" id="btn-labels" onclick="toggleLabels()"><i class="ti ti-tag" aria-hidden="true"></i> Labels</button>
+    <span style="flex:1"></span>
+    <span class="ctrl-label" style="color:#3a5070; font-size:10px;">P → 2P → 4P → 8P</span>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('ecc-canvas');
+const ctx = canvas.getContext('2d');
+
+const W = 680, H = 480;
+canvas.width = W; canvas.height = H;
+
+let showLabels = true;
+let isPlaying = false;
+let animFrame = null;
+let speed = 5;
+
+// Curve: y^2 = x^3 - x + 1
+function curveY(x) {
+  const v = x*x*x - x + 1;
+  return v >= 0 ? Math.sqrt(v) : NaN;
+}
+
+// View transform: real coords → canvas coords
+const VIEW = { cx: 1.0, cy: 1.2, scale: 80 };
+function toCanvas(rx, ry) {
+  return [
+    W/2 + (rx - VIEW.cx) * VIEW.scale,
+    H/2 - (ry - VIEW.cy) * VIEW.scale
+  ];
+}
+function fromCanvas(cx, cy) {
+  return [
+    VIEW.cx + (cx - W/2) / VIEW.scale,
+    VIEW.cy - (cy - H/2) / VIEW.scale
+  ];
+}
+
+// Compute tangent slope at point (px, py) on y^2 = x^3 - x + 1
+// dy/dx = (3x^2 - 1) / (2y)
+function tangentSlope(px, py) {
+  return (3*px*px - 1) / (2*py);
+}
+
+// Double a point: given P=(px,py), return 2P
+function doublePoint(px, py) {
+  const m = tangentSlope(px, py);
+  const x3 = m*m - 2*px;
+  const y3 = m*(px - x3) - py;
+  return [x3, y3];
+}
+
+// Start point P (chosen to be visible on curve)
+const Px = -0.73, Py = curveY(-0.73);
+const [P2x, P2y] = doublePoint(Px, Py);
+const [P4x, P4y] = doublePoint(P2x, P2y);
+const [P8x, P8y] = doublePoint(P4x, P4y);
+
+const POINTS = [
+  { label: 'P',  x: Px,  y: Py,  color: '#58c4ff' },
+  { label: '2P', x: P2x, y: P2y, color: '#a78bfa' },
+  { label: '4P', x: P4x, y: P4y, color: '#f472b6' },
+  { label: '8P', x: P8x, y: P8y, color: '#34d399' },
+];
+
+// Animation substeps for each doubling:
+// Each step: draw tangent, show intersection, reflect, show result
+// Substeps: 0=tangent, 1=intersection, 2=reflect arrow, 3=result point
+
+let animState = {
+  round: 0,      // 0,1,2 → P→2P, 2P→4P, 4P→8P
+  substep: 0,    // 0..3
+  progress: 0,   // 0..1 within substep
+  done: false,
+  pointsRevealed: [true, false, false, false],
+};
+
+let lastTime = null;
+const SUBSTEP_DUR = [900, 600, 700, 400]; // ms per substep, speed-adjusted
+
+function getStepDur(sub) {
+  return SUBSTEP_DUR[sub] * (11 - speed) / 5;
+}
+
+const INFOS = [
+  [
+    { tag: 'Step 1: P → 2P', desc: 'Drawing tangent line at P', formula: 'slope m = (3x² − 1) / 2y' },
+    { tag: 'Step 1: P → 2P', desc: 'Finding intersection with curve', formula: 'x₃ = m² − 2x₁' },
+    { tag: 'Step 1: P → 2P', desc: 'Reflecting across x-axis', formula: 'y₃ = m(x₁ − x₃) − y₁' },
+    { tag: 'Step 1: P → 2P', desc: '2P revealed — first doubling complete!', formula: '2P ≈ (' + P2x.toFixed(2) + ', ' + P2y.toFixed(2) + ')' },
+  ],
+  [
+    { tag: 'Step 2: 2P → 4P', desc: 'Drawing tangent line at 2P', formula: 'slope m = (3x² − 1) / 2y' },
+    { tag: 'Step 2: 2P → 4P', desc: 'Finding intersection with curve', formula: 'x₃ = m² − 2x₁' },
+    { tag: 'Step 2: 2P → 4P', desc: 'Reflecting across x-axis', formula: 'y₃ = m(x₁ − x₃) − y₁' },
+    { tag: 'Step 2: 2P → 4P', desc: '4P revealed — second doubling complete!', formula: '4P ≈ (' + P4x.toFixed(2) + ', ' + P4y.toFixed(2) + ')' },
+  ],
+  [
+    { tag: 'Step 3: 4P → 8P', desc: 'Drawing tangent line at 4P', formula: 'slope m = (3x² − 1) / 2y' },
+    { tag: 'Step 3: 4P → 8P', desc: 'Finding intersection with curve', formula: 'x₃ = m² − 2x₁' },
+    { tag: 'Step 3: 4P → 8P', desc: 'Reflecting across x-axis', formula: 'y₃ = m(x₁ − x₃) − y₁' },
+    { tag: 'Step 3: 4P → 8P', desc: '8P revealed — scalar multiplication: 8P = 2(2(2P))!', formula: '8P ≈ (' + P8x.toFixed(2) + ', ' + P8y.toFixed(2) + ')' },
+  ],
+];
+
+function updateInfo() {
+  if (animState.done) {
+    document.getElementById('step-tag').textContent = 'Complete';
+    document.getElementById('step-desc').textContent = '👉 P → 2P → 4P → 8P via repeated doubling — the foundation of ECC!';
+    document.getElementById('step-formula').textContent = '8P = 2³·P  (3 doublings)';
+    return;
+  }
+  const info = INFOS[animState.round]?.[animState.substep];
+  if (!info) return;
+  document.getElementById('step-tag').textContent = info.tag;
+  document.getElementById('step-desc').textContent = info.desc;
+  document.getElementById('step-formula').textContent = info.formula;
+}
+
+function drawScene(t) {
+  ctx.clearRect(0, 0, W, H);
+
+  // Background
+  ctx.fillStyle = '#0a0e1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#151e35';
+  ctx.lineWidth = 0.5;
+  const gridStep = VIEW.scale;
+  for (let rx = -8; rx <= 8; rx++) {
+    const [cx] = toCanvas(VIEW.cx + rx, 0);
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke();
+  }
+  for (let ry = -8; ry <= 8; ry++) {
+    const [,cy] = toCanvas(0, VIEW.cy + ry);
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+  }
+
+  // Axes
+  ctx.strokeStyle = '#1e2d50';
+  ctx.lineWidth = 1;
+  const [ox, oy] = toCanvas(0, 0);
+  ctx.beginPath(); ctx.moveTo(0, oy); ctx.lineTo(W, oy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(ox, H); ctx.stroke();
+
+  // Axis labels
+  ctx.fillStyle = '#2a3d60';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'center';
+  for (let i = -4; i <= 4; i++) {
+    if (i === 0) continue;
+    const [cx] = toCanvas(i, 0);
+    ctx.fillText(i, cx, oy + 14);
+    const [,cy] = toCanvas(0, i);
+    ctx.fillText(i, ox - 14, cy + 4);
+  }
+
+  // Draw curve (both branches)
+  function drawBranch(sign) {
+    let started = false;
+    ctx.beginPath();
+    for (let px = -3.5; px <= 3.5; px += 0.008) {
+      const v = px*px*px - px + 1;
+      if (v < 0) { started = false; continue; }
+      const py = sign * Math.sqrt(v);
+      const [cx, cy] = toCanvas(px, py);
+      if (!started) { ctx.moveTo(cx, cy); started = true; }
+      else ctx.lineTo(cx, cy);
+    }
+    ctx.stroke();
+  }
+
+  // Neon curve glow
+  ctx.shadowColor = '#2563eb';
+  ctx.shadowBlur = 12;
+  ctx.strokeStyle = '#3b82f6';
+  ctx.lineWidth = 1.5;
+  drawBranch(1); drawBranch(-1);
+  ctx.shadowBlur = 0;
+
+  const s = animState;
+  const round = s.round;
+  const sub = s.substep;
+  const prog = s.progress;
+
+  // Source and destination for current round
+  const src = POINTS[round];
+  const dst = POINTS[round + 1];
+
+  // Intermediate "intersection" point (pre-reflection)
+  const intX = dst.x;
+  const intY = -dst.y;
+
+  // --- Draw animation elements for current round ---
+  if (!s.done || round < 3) {
+    const m = tangentSlope(src.x, src.y);
+
+    // Substep 0: draw tangent line
+    if (sub >= 0) {
+      const alpha = sub === 0 ? prog : 1;
+      const span = 2.5;
+      const tx0 = src.x - span;
+      const tx1 = src.x + span;
+      const ty0 = src.y + m * (tx0 - src.x);
+      const ty1 = src.y + m * (tx1 - src.x);
+      const [cx0, cy0] = toCanvas(tx0, ty0);
+      const [cx1f, cy1f] = toCanvas(tx1, ty1);
+      const lx = cx0 + (cx1f - cx0) * alpha;
+      const ly = cy0 + (cy1f - cy0) * alpha;
+      ctx.save();
+      ctx.strokeStyle = `rgba(251,191,36,${0.55 * alpha})`;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 3]);
+      ctx.shadowColor = '#f59e0b';
+      ctx.shadowBlur = 6 * alpha;
+      ctx.beginPath(); ctx.moveTo(cx0, cy0); ctx.lineTo(lx, ly); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.shadowBlur = 0;
+
+      // Label "Tangent Line"
+      if (showLabels && alpha > 0.5) {
+        ctx.fillStyle = `rgba(251,191,36,${alpha * 0.8})`;
+        ctx.font = '11px var(--font-sans, sans-serif)';
+        ctx.textAlign = 'left';
+        const midX = (cx0 + lx) / 2;
+        const midY = (cy0 + ly) / 2;
+        ctx.fillText('Tangent', midX + 8, midY - 8);
+      }
+      ctx.restore();
+    }
+
+    // Substep 1: show intersection point
+    if (sub >= 1) {
+      const alpha = sub === 1 ? prog : 1;
+      const [icx, icy] = toCanvas(intX, intY);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.arc(icx, icy, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#f97316';
+      ctx.shadowColor = '#f97316';
+      ctx.shadowBlur = 10;
+      ctx.fill();
+      if (showLabels) {
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#fbbf24';
+        ctx.font = '11px var(--font-sans, sans-serif)';
+        ctx.textAlign = 'left';
+        ctx.fillText('Intersection', icx + 8, icy - 4);
+      }
+      ctx.restore();
+    }
+
+    // Substep 2: reflection arrow
+    if (sub >= 2) {
+      const alpha = sub === 2 ? prog : 1;
+      const [icx, icy] = toCanvas(intX, intY);
+      const [dcx, dcy] = toCanvas(dst.x, dst.y);
+      const midY = icy + (dcy - icy) * alpha;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = '#a78bfa';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(icx, icy); ctx.lineTo(icx, midY); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Arrowhead
+      if (alpha > 0.8) {
+        ctx.beginPath();
+        ctx.moveTo(icx, midY);
+        ctx.lineTo(icx - 5, midY - 10);
+        ctx.lineTo(icx + 5, midY - 10);
+        ctx.closePath();
+        ctx.fillStyle = '#a78bfa';
+        ctx.fill();
+      }
+
+      // x-axis line for reference
+      const [axL] = toCanvas(intX - 0.4, 0);
+      const [axR] = toCanvas(intX + 0.4, 0);
+      const [, axY] = toCanvas(0, 0);
+      ctx.strokeStyle = `rgba(167,139,250,${0.3*alpha})`;
+      ctx.lineWidth = 0.8;
+      ctx.beginPath(); ctx.moveTo(axL, axY); ctx.lineTo(axR, axY); ctx.stroke();
+
+      if (showLabels && alpha > 0.5) {
+        ctx.fillStyle = `rgba(167,139,250,${alpha})`;
+        ctx.font = '11px var(--font-sans, sans-serif)';
+        ctx.textAlign = 'left';
+        ctx.fillText('Reflection', icx + 8, (icy + midY) / 2);
+      }
+      ctx.restore();
+    }
+  }
+
+  // Draw revealed points
+  for (let i = 0; i < POINTS.length; i++) {
+    if (!s.pointsRevealed[i]) continue;
+    const pt = POINTS[i];
+    const [cx, cy] = toCanvas(pt.x, pt.y);
+
+    // Glow
+    ctx.save();
+    ctx.shadowColor = pt.color;
+    ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+    ctx.fillStyle = pt.color;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Inner white dot
+    ctx.beginPath();
+    ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    ctx.restore();
+
+    // Label
+    if (showLabels) {
+      ctx.save();
+      ctx.fillStyle = pt.color;
+      ctx.font = 'bold 13px var(--font-sans, sans-serif)';
+      ctx.textAlign = 'left';
+      const isFinale = s.done;
+      ctx.shadowColor = pt.color;
+      ctx.shadowBlur = isFinale && i === 3 ? 12 : 0;
+      ctx.fillText(pt.label, cx + 10, cy - 6);
+      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
+  }
+
+  // Finale overlay
+  if (s.done) {
+    ctx.save();
+
+    // Connection trail
+    for (let i = 0; i < POINTS.length - 1; i++) {
+      const [ax, ay] = toCanvas(POINTS[i].x, POINTS[i].y);
+      const [bx, by] = toCanvas(POINTS[i+1].x, POINTS[i+1].y);
+      ctx.strokeStyle = POINTS[i+1].color;
+      ctx.globalAlpha = 0.3;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.globalAlpha = 1;
+
+    // Summary box
+    const bx = 16, by = H - 100, bw = 340, bh = 82;
+    ctx.fillStyle = 'rgba(10,14,26,0.88)';
+    ctx.strokeStyle = '#1e3a5a';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 8); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#58c4ff';
+    ctx.font = 'bold 13px var(--font-sans, sans-serif)';
+    ctx.textAlign = 'left';
+    ctx.fillText('Scalar Multiplication: kP', bx+12, by+22);
+    ctx.fillStyle = '#8aa8c0';
+    ctx.font = '11px var(--font-sans, sans-serif)';
+    ctx.fillText('P → 2P → 4P → 8P  =  3 doublings', bx+12, by+42);
+    ctx.fillText('8P = 2³·P  (binary method: efficient & one-way)', bx+12, by+58);
+    ctx.fillStyle = '#4a8aaa';
+    ctx.fillText('Foundation of ECC public-key cryptography', bx+12, by+76);
+    ctx.restore();
+  }
+
+  // Title
+  ctx.save();
+  ctx.fillStyle = '#2a4060';
+  ctx.font = '12px var(--font-mono, monospace)';
+  ctx.textAlign = 'right';
+  ctx.fillText('y² = x³ − x + 1', W - 14, 20);
+  ctx.restore();
+}
+
+// ---- Animation loop ----
+function animate(ts) {
+  if (!isPlaying) return;
+  if (!lastTime) lastTime = ts;
+  const dt = ts - lastTime;
+  lastTime = ts;
+
+  const s = animState;
+  if (!s.done) {
+    const dur = getStepDur(s.substep);
+    s.progress = Math.min(1, s.progress + dt / dur);
+    if (s.progress >= 1) {
+      // Advance substep
+      if (s.substep === 3) {
+        // Reveal next point
+        s.pointsRevealed[s.round + 1] = true;
+        if (s.round < 2) {
+          s.round++;
+          s.substep = 0;
+        } else {
+          s.done = true;
+          isPlaying = false;
+          document.getElementById('btn-play').innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play';
+        }
+      } else {
+        s.substep++;
+      }
+      s.progress = 0;
+      updateInfo();
+    }
+  }
+
+  drawScene();
+  if (isPlaying) animFrame = requestAnimationFrame(animate);
+}
+
+function togglePlay() {
+  const btn = document.getElementById('btn-play');
+  if (animState.done) return;
+  isPlaying = !isPlaying;
+  if (isPlaying) {
+    btn.innerHTML = '<i class="ti ti-player-pause" aria-hidden="true"></i> Pause';
+    lastTime = null;
+    animFrame = requestAnimationFrame(animate);
+  } else {
+    btn.innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play';
+    if (animFrame) cancelAnimationFrame(animFrame);
+  }
+}
+
+function stepForward() {
+  if (isPlaying) { togglePlay(); }
+  const s = animState;
+  if (s.done) return;
+  s.progress = 1;
+  if (s.substep === 3) {
+    s.pointsRevealed[s.round + 1] = true;
+    if (s.round < 2) { s.round++; s.substep = 0; }
+    else { s.done = true; }
+  } else {
+    s.substep++;
+  }
+  s.progress = 0;
+  updateInfo();
+  drawScene();
+}
+
+function resetAnim() {
+  if (isPlaying) togglePlay();
+  if (animFrame) cancelAnimationFrame(animFrame);
+  animState = { round: 0, substep: 0, progress: 0, done: false, pointsRevealed: [true, false, false, false] };
+  isPlaying = false;
+  lastTime = null;
+  document.getElementById('btn-play').innerHTML = '<i class="ti ti-player-play" aria-hidden="true"></i> Play';
+  document.getElementById('step-tag').textContent = 'Ready';
+  document.getElementById('step-desc').textContent = 'Press Play or Step to begin point doubling animation';
+  document.getElementById('step-formula').textContent = 'y² = x³ − x + 1';
+  drawScene();
+}
+
+function updateSpeed(v) { speed = parseInt(v); }
+
+function toggleLabels() {
+  showLabels = !showLabels;
+  document.getElementById('btn-labels').classList.toggle('active', showLabels);
+  drawScene();
+}
+
+// Initial render
+updateInfo();
+drawScene();
+</script>
